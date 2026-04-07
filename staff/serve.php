@@ -17,6 +17,7 @@ require_once __DIR__ . "/../config/helpers.php";
 // Set local time
 date_default_timezone_set('Asia/Manila');
 $today = date('Y-m-d');
+$currentCounterId = isset($_SESSION['counter_id']) ? (int)$_SESSION['counter_id'] : 0;
 
 // Queue group counters
 const PRIORITY_COUNTER = 2;
@@ -43,6 +44,45 @@ function get_group_counters(string $group): array
   }
 
   return [];
+}
+
+// Initialize active counters for a group if missing
+function ensure_group_active_counters_initialized(string $group, int $currentCounterId = 0): void
+{
+  if (!isset($_SESSION['active_counters']) || !is_array($_SESSION['active_counters'])) {
+    $_SESSION['active_counters'] = [];
+  }
+
+  if (isset($_SESSION['active_counters'][$group]) && is_array($_SESSION['active_counters'][$group])) {
+    return;
+  }
+
+  $groupCounters = get_group_counters($group);
+
+  // Default: if current counter belongs to this group, make it active initially.
+  // Otherwise, start with no active counters until staff checks them manually.
+  if ($currentCounterId > 0 && in_array($currentCounterId, $groupCounters, true)) {
+    $_SESSION['active_counters'][$group] = [$currentCounterId];
+  } else {
+    $_SESSION['active_counters'][$group] = [];
+  }
+}
+
+// Return manually selected active counters for the selected group
+function get_active_group_counters(string $group): array
+{
+  $groupCounters = get_group_counters($group);
+  $saved = $_SESSION['active_counters'][$group] ?? [];
+
+  if (!is_array($saved)) {
+    return [];
+  }
+
+  $saved = array_map('intval', $saved);
+  $saved = array_values(array_intersect($groupCounters, $saved));
+  sort($saved);
+
+  return $saved;
 }
 
 // Build SQL rules for each group
@@ -107,10 +147,10 @@ function get_group_waiting_count(mysqli $conn, string $today, string $group): in
   return $count;
 }
 
-// Find first free counter in selected group
+// Find first free active counter in selected group
 function get_first_free_counter(mysqli $conn, string $today, string $group): ?int
 {
-  $counters = get_group_counters($group);
+  $counters = get_active_group_counters($group);
   if (!$counters) {
     return null;
   }
@@ -141,11 +181,11 @@ function get_first_free_counter(mysqli $conn, string $today, string $group): ?in
   return null;
 }
 
-// Count how many counters are currently serving in this group
+// Count how many active counters are currently serving in this group
 function get_group_serving_count(mysqli $conn, string $today, string $group): int
 {
   [$guardJoin, $guardWhere, $guardTypes, $guardParams] = build_group_guard($group);
-  $counters = get_group_counters($group);
+  $counters = get_active_group_counters($group);
 
   if (!$counters) {
     return 0;
@@ -178,11 +218,11 @@ function get_group_serving_count(mysqli $conn, string $today, string $group): in
   return (int)($row['c'] ?? 0);
 }
 
-// Get one current serving queue in selected group (oldest serving)
+// Get one current serving queue in selected group (oldest among active counters)
 function get_group_serving(mysqli $conn, string $today, string $group): ?array
 {
   [$guardJoin, $guardWhere, $guardTypes, $guardParams] = build_group_guard($group);
-  $counters = get_group_counters($group);
+  $counters = get_active_group_counters($group);
 
   if (!$counters) {
     return null;
@@ -267,8 +307,9 @@ function get_group_waiting_list(mysqli $conn, string $today, string $group): arr
 // Return live summary for the selected group
 function get_group_live_summary(mysqli $conn, string $today, string $group): array
 {
-  $counters = get_group_counters($group);
-  $totalCounters = count($counters);
+  $allCounters = get_group_counters($group);
+  $activeCounters = get_active_group_counters($group);
+  $totalCounters = count($activeCounters);
   $waitingCount = get_group_waiting_count($conn, $today, $group);
   $servingCount = get_group_serving_count($conn, $today, $group);
   $freeCounter = get_first_free_counter($conn, $today, $group);
@@ -276,6 +317,8 @@ function get_group_live_summary(mysqli $conn, string $today, string $group): arr
 
   return [
     'group' => $group,
+    'group_counters' => $allCounters,
+    'active_counters' => $activeCounters,
     'total_counters' => $totalCounters,
     'serving_count' => $servingCount,
     'waiting_count' => $waitingCount,
@@ -285,6 +328,21 @@ function get_group_live_summary(mysqli $conn, string $today, string $group): arr
     'serving' => $serving
   ];
 }
+
+/* =========================================================
+   Selected queue group setup
+========================================================= */
+
+$selectedQueueGroup = $_SESSION['selected_queue_group'] ?? 'membership';
+if (!in_array($selectedQueueGroup, ['priority', 'membership', 'hospitalization'], true)) {
+  $selectedQueueGroup = 'membership';
+  $_SESSION['selected_queue_group'] = $selectedQueueGroup;
+}
+
+// Ensure active counters exist for all groups
+ensure_group_active_counters_initialized('priority', $currentCounterId);
+ensure_group_active_counters_initialized('membership', $currentCounterId);
+ensure_group_active_counters_initialized('hospitalization', $currentCounterId);
 
 /* =========================================================
    AJAX requests
@@ -326,6 +384,8 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'summary') {
   if ($group === '') {
     echo json_encode([
       'group' => '',
+      'group_counters' => [],
+      'active_counters' => [],
       'total_counters' => 0,
       'serving_count' => 0,
       'waiting_count' => 0,
@@ -371,6 +431,8 @@ if ($selectedQueueGroup === 'priority') {
 }
 
 $initialSummary = get_group_live_summary($conn, $today, $selectedQueueGroup);
+$selectedGroupCounters = get_group_counters($selectedQueueGroup);
+$selectedActiveCounters = get_active_group_counters($selectedQueueGroup);
 
 /* =========================================================
    Form actions
@@ -388,8 +450,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       $_SESSION['error'] = "Invalid queue group selected.";
     } else {
       $_SESSION['selected_queue_group'] = $newGroup;
+      ensure_group_active_counters_initialized($newGroup, $currentCounterId);
       $_SESSION['success'] = "Queue group set successfully.";
     }
+
+    header("Location: serve.php");
+    exit();
+  }
+
+  // Save manual active counters
+  if ($action === 'set_active_counters') {
+    $group = $_SESSION['selected_queue_group'] ?? 'membership';
+    $allowed = get_group_counters($group);
+    $posted = $_POST['active_counters'] ?? [];
+    if (!is_array($posted)) {
+      $posted = [];
+    }
+
+    $newActive = [];
+    foreach ($posted as $cid) {
+      $cid = (int)$cid;
+      if (in_array($cid, $allowed, true)) {
+        $newActive[] = $cid;
+      }
+    }
+
+    $newActive = array_values(array_unique($newActive));
+    sort($newActive);
+
+    $_SESSION['active_counters'][$group] = $newActive;
+    $_SESSION['success'] = "Active counters updated.";
 
     header("Location: serve.php");
     exit();
@@ -403,6 +493,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     exit();
   }
 
+  $activeCounters = get_active_group_counters($group);
+  if (!$activeCounters) {
+    $_SESSION['error'] = "Please select at least one active counter for this queue group.";
+    header("Location: serve.php");
+    exit();
+  }
+
   $conn->begin_transaction();
 
   try {
@@ -410,22 +507,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'call_next') {
       [$guardJoin, $guardWhere, $guardTypes, $guardParams] = build_group_guard($group);
 
-      // Lock the next waiting queue first
       $sql = "
-    SELECT
-      q.queue_id,
-      q.appointment_id,
-      q.queue_code,
-      q.category_id
-    FROM queue q
-    $guardJoin
-    WHERE q.queue_date = ?
-      AND q.status = 'waiting'
-      $guardWhere
-    ORDER BY q.created_at ASC
-    LIMIT 1
-    FOR UPDATE
-  ";
+        SELECT
+          q.queue_id,
+          q.appointment_id,
+          q.queue_code,
+          q.category_id
+        FROM queue q
+        $guardJoin
+        WHERE q.queue_date = ?
+          AND q.status = 'waiting'
+          $guardWhere
+        ORDER BY q.created_at ASC
+        LIMIT 1
+        FOR UPDATE
+      ";
 
       $stmt = $conn->prepare($sql);
       if (!$stmt) {
@@ -444,25 +540,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         throw new Exception("No waiting clients in this queue group.");
       }
 
-      // Re-check free counter INSIDE the transaction
       $freeCounter = get_first_free_counter($conn, $today, $group);
 
       if ($freeCounter === null) {
-        throw new Exception("No free counter available in this group.");
+        throw new Exception("No free active counter available in this group.");
       }
 
       $qid    = (int)$next['queue_id'];
       $cat_id = (int)$next['category_id'];
       $aid    = !empty($next['appointment_id']) ? (int)$next['appointment_id'] : null;
 
-      // Extra safety: only update if still waiting
       $stmt = $conn->prepare("
-    UPDATE queue
-    SET status = 'serving',
-        counter_id = ?
-    WHERE queue_id = ?
-      AND status = 'waiting'
-  ");
+        UPDATE queue
+        SET status = 'serving',
+            counter_id = ?
+        WHERE queue_id = ?
+          AND status = 'waiting'
+      ");
       if (!$stmt) {
         throw new Exception("Failed to update queue status.");
       }
@@ -479,10 +573,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
       if ($aid !== null) {
         $stmt = $conn->prepare("
-      UPDATE appointments
-      SET counter_id = ?
-      WHERE appointment_id = ?
-    ");
+          UPDATE appointments
+          SET counter_id = ?
+          WHERE appointment_id = ?
+        ");
         if ($stmt) {
           $stmt->bind_param("ii", $freeCounter, $aid);
           $stmt->execute();
@@ -504,7 +598,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       $_SESSION['success'] = "Now serving: " . $next['queue_code'] . " at Counter " . $freeCounter;
     }
 
-    // Mark one current serving as done (oldest serving in the selected group)
+    // Mark one current serving as done among active counters
     if ($action === 'mark_done') {
       $serving = get_group_serving($conn, $today, $group);
 
@@ -521,13 +615,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         UPDATE queue
         SET status = 'done'
         WHERE queue_id = ?
+          AND counter_id = ?
+          AND status = 'serving'
       ");
       if (!$stmt) {
         throw new Exception("Failed to update serving queue.");
       }
 
-      $stmt->bind_param("i", $qid);
+      $stmt->bind_param("ii", $qid, $counter_id);
       $stmt->execute();
+
+      if ($stmt->affected_rows !== 1) {
+        $stmt->close();
+        throw new Exception("Serving queue could not be completed.");
+      }
+
       $stmt->close();
 
       if ($aid !== null) {
@@ -715,6 +817,41 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           </div>
 
           <div class="mt-4 rounded-2xl border border-white/60 bg-white/80 p-4">
+            <div class="text-xs font-bold text-slate-500 uppercase tracking-wide mb-3">Counter Availability</div>
+
+            <form method="POST" class="space-y-3">
+              <?php echo csrf_field(); ?>
+              <input type="hidden" name="action" value="set_active_counters" />
+
+              <?php foreach ($selectedGroupCounters as $cid): ?>
+                <?php $checked = in_array($cid, $selectedActiveCounters, true); ?>
+                <label class="flex items-center justify-between rounded-xl border border-white/60 bg-white/90 px-3 py-2">
+                  <span class="text-sm font-semibold text-slate-800">
+                    Counter <?php echo (int)$cid; ?>
+                  </span>
+                  <span class="flex items-center gap-2">
+                    <span class="text-xs font-bold <?php echo $checked ? 'text-emerald-700' : 'text-slate-500'; ?>">
+                      <?php echo $checked ? 'Active' : 'Inactive'; ?>
+                    </span>
+                    <input
+                      type="checkbox"
+                      name="active_counters[]"
+                      value="<?php echo (int)$cid; ?>"
+                      <?php echo $checked ? 'checked' : ''; ?>
+                      class="h-4 w-4 rounded border-slate-300 text-brand-700 focus:ring-brand-200">
+                  </span>
+                </label>
+              <?php endforeach; ?>
+
+              <button
+                type="submit"
+                class="w-full rounded-xl border border-white/60 bg-white/80 hover:bg-white text-slate-800 py-2.5 text-sm font-extrabold transition active:scale-[.99]">
+                Save Counter Status
+              </button>
+            </form>
+          </div>
+
+          <div class="mt-4 rounded-2xl border border-white/60 bg-white/80 p-4">
             <div class="text-xs font-bold text-slate-500 uppercase tracking-wide">Now Serving</div>
             <div id="servingCode" class="mt-2 text-4xl font-extrabold tracking-tight text-slate-300">—</div>
             <div id="servingCat" class="mt-1 text-xs font-bold text-slate-500 uppercase"></div>
@@ -748,7 +885,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             </div>
 
             <p class="mt-3 text-xs text-slate-500">
-              Call Next is disabled only when no free counter is available or waiting is 0.
+              Call Next is disabled when no active free counter is available or waiting is 0.
             </p>
           </div>
         </div>
@@ -757,8 +894,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           <div class="text-sm font-extrabold">Quick Rules</div>
           <ul class="mt-2 text-sm text-slate-600 space-y-1 list-disc pl-5">
             <li>FCFS by queue group</li>
-            <li>Client may proceed to any free counter in the group</li>
-            <li>Call Next remains enabled while another counter in the group is free</li>
+            <li>Staff manually sets which counters are active or inactive</li>
+            <li>Only active counters receive the next queue</li>
             <li>Mark Done completes one active serving queue in the group</li>
           </ul>
         </div>
