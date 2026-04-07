@@ -30,10 +30,28 @@ const BENEFIT_AVAILMENT_COUNTERS = [8, 9];
 const PRIORITY_STATUSES_SQL = "'Senior Citizen','PWD','Pregnant'";
 
 /* =========================================================
-   Simple database helper functions
-   ========================================================= */
+   Counter status from session
+========================================================= */
 
-// Get one row
+$activeMap = [
+  'priority' => $_SESSION['active_counters']['priority'] ?? [],
+  'membership' => $_SESSION['active_counters']['membership'] ?? [],
+  'hospitalization' => $_SESSION['active_counters']['hospitalization'] ?? [],
+];
+
+$flatActiveCounters = [];
+foreach ($activeMap as $groupCounters) {
+  if (is_array($groupCounters)) {
+    foreach ($groupCounters as $cid) {
+      $flatActiveCounters[(int)$cid] = true;
+    }
+  }
+}
+
+/* =========================================================
+   Simple database helper functions
+========================================================= */
+
 function fetch_one(mysqli $conn, string $sql, string $types, array $params): ?array
 {
   $stmt = $conn->prepare($sql);
@@ -52,7 +70,6 @@ function fetch_one(mysqli $conn, string $sql, string $types, array $params): ?ar
   return $row ?: null;
 }
 
-// Get many rows
 function fetch_all(mysqli $conn, string $sql, string $types, array $params): array
 {
   $stmt = $conn->prepare($sql);
@@ -73,9 +90,8 @@ function fetch_all(mysqli $conn, string $sql, string $types, array $params): arr
 
 /* =========================================================
    Queue data functions
-   ========================================================= */
+========================================================= */
 
-// Get all serving rows for selected counters
 function serving_list_by_counters(
   mysqli $conn,
   string $date,
@@ -122,7 +138,6 @@ function serving_list_by_counters(
   return fetch_all($conn, $sql, $types, $params);
 }
 
-// Get next waiting queue in shared line
 function next_waiting_overall(
   mysqli $conn,
   string $date,
@@ -161,10 +176,8 @@ function next_waiting_overall(
   return fetch_one($conn, $sql, $types, $params);
 }
 
-// Build all board data
 function payload(mysqli $conn, string $today): array
 {
-  // Membership data
   $m_serving_list = serving_list_by_counters(
     $conn,
     $today,
@@ -180,7 +193,6 @@ function payload(mysqli $conn, string $today): array
     false
   );
 
-  // Hospitalization data
   $h_serving_list = serving_list_by_counters(
     $conn,
     $today,
@@ -196,7 +208,6 @@ function payload(mysqli $conn, string $today): array
     false
   );
 
-  // Priority data
   $p_serving_list = serving_list_by_counters(
     $conn,
     $today,
@@ -239,7 +250,7 @@ function payload(mysqli $conn, string $today): array
 
 /* =========================================================
    Ajax refresh
-   ========================================================= */
+========================================================= */
 
 if (isset($_GET['ajax']) && $_GET['ajax'] === '1') {
   header('Content-Type: application/json; charset=utf-8');
@@ -247,18 +258,11 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === '1') {
   exit();
 }
 
-// First page load
 $init = payload($conn, $today);
 
-// Small display helpers
 function code_or_dash(?array $row): string
 {
   return ($row && !empty($row['queue_code'])) ? (string)$row['queue_code'] : '—';
-}
-
-function counter_or_dash(?array $row): string
-{
-  return ($row && !empty($row['counter_id'])) ? "Counter " . (int)$row['counter_id'] : '—';
 }
 
 function service_or_dash(?array $row): string
@@ -359,7 +363,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
       from {
         transform: translateX(0);
       }
-
       to {
         transform: translateX(-50%);
       }
@@ -374,12 +377,10 @@ function serving_for_counter(array $rows, int $counterId): ?array
         transform: scale(1);
         box-shadow: 0 0 0 rgba(0, 0, 0, 0);
       }
-
       20% {
         transform: scale(1.02);
         box-shadow: 0 12px 40px rgba(20, 80, 20, .22);
       }
-
       100% {
         transform: scale(1);
         box-shadow: 0 0 0 rgba(0, 0, 0, 0);
@@ -410,7 +411,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
       .ticker-track {
         animation: none;
       }
-
       .flash {
         animation: none;
       }
@@ -424,7 +424,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
 
   <div class="mx-auto w-full max-w-[1700px] px-3 sm:px-5 lg:px-7 py-4 sm:py-5 space-y-3 sm:space-y-4">
 
-    <!-- Header -->
     <header class="tile rounded-3xl px-4 sm:px-5 py-3 sm:py-4 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
       <div class="flex items-center gap-3 min-w-0">
         <img
@@ -459,7 +458,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
       </div>
     </header>
 
-    <!-- Notice -->
     <div class="ticker rounded-2xl px-4 sm:px-5">
       <div class="ticker-track" aria-hidden="true">
         <div class="font-extrabold text-slate-800">NOTICE:</div>
@@ -474,7 +472,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
 
     <main class="grid grid-cols-1 lg:grid-cols-3 gap-3 sm:gap-4 lg:gap-4">
 
-      <!-- Membership -->
       <section id="membershipSection" class="tile rounded-3xl p-4 sm:p-5 lg:order-1">
         <div class="flex items-center justify-between gap-3">
           <div>
@@ -488,11 +485,17 @@ function serving_for_counter(array $rows, int $counterId): ?array
 
         <div class="grid grid-cols-3 gap-2 mt-4">
           <?php foreach (MEMBERSHIP_COUNTERS as $cid): ?>
-            <?php $serving = serving_for_counter($init['membership']['serving_list'], $cid); ?>
+            <?php
+              $serving = serving_for_counter($init['membership']['serving_list'], $cid);
+              $isActive = isset($flatActiveCounters[$cid]);
+            ?>
             <div class="soft rounded-2xl p-4 text-center">
-              <div class="font-bold text-sm mb-2">Counter <?php echo $cid; ?></div>
+              <div class="font-bold text-sm mb-1">Counter <?php echo $cid; ?></div>
+              <div class="text-xs font-bold mb-2 <?php echo $isActive ? 'text-emerald-700' : 'text-slate-400'; ?>">
+                ● <?php echo $isActive ? 'Active' : 'Inactive'; ?>
+              </div>
               <div class="text-xs font-bold text-gray-500">NOW SERVING</div>
-              <div id="m-counter-<?php echo $cid; ?>" class="text-2xl font-black text-green-700">
+              <div id="m-counter-<?php echo $cid; ?>" class="text-2xl font-black <?php echo $isActive ? 'text-green-700' : 'text-slate-300'; ?>">
                 <?php echo e($serving['queue_code'] ?? '—'); ?>
               </div>
             </div>
@@ -517,7 +520,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
         </div>
       </section>
 
-      <!-- Priority -->
       <section id="prioritySection" class="tile rounded-3xl p-4 sm:p-5 text-center lg:order-2">
         <div class="flex items-center justify-between gap-3">
           <div class="text-base sm:text-lg font-extrabold">
@@ -538,10 +540,15 @@ function serving_for_counter(array $rows, int $counterId): ?array
           </div>
         </div>
 
+        <?php $priorityActive = isset($flatActiveCounters[PRIORITY_COUNTER]); ?>
+
         <div class="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
           <div class="soft rounded-2xl p-4 flex flex-col">
             <div class="text-[11px] font-extrabold text-slate-500 uppercase">Now Serving</div>
-            <div id="p-serving-code" class="mt-3 text-center font-black text-brand-700 qcode-serving break-words">
+            <div class="mt-1 text-xs font-bold <?php echo $priorityActive ? 'text-emerald-700' : 'text-slate-400'; ?>">
+              ● <?php echo $priorityActive ? 'Active' : 'Inactive'; ?>
+            </div>
+            <div id="p-serving-code" class="mt-3 text-center font-black <?php echo $priorityActive ? 'text-brand-700' : 'text-slate-300'; ?> qcode-serving break-words">
               <?php echo e(code_or_dash($init['priority']['serving_main'])); ?>
             </div>
             <div id="p-serving-counter" class="mt-2 text-center text-sm font-extrabold text-slate-800">
@@ -567,7 +574,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
         </div>
       </section>
 
-      <!--Benefit Availment  -->
       <section id="hospitalSection" class="tile rounded-3xl p-4 sm:p-5 lg:order-3">
         <div class="flex items-center justify-between gap-3">
           <div>
@@ -581,11 +587,17 @@ function serving_for_counter(array $rows, int $counterId): ?array
 
         <div class="grid grid-cols-2 gap-4 mt-4">
           <?php foreach (BENEFIT_AVAILMENT_COUNTERS as $cid): ?>
-            <?php $serving = serving_for_counter($init['hospitalization']['serving_list'], $cid); ?>
+            <?php
+              $serving = serving_for_counter($init['hospitalization']['serving_list'], $cid);
+              $isActive = isset($flatActiveCounters[$cid]);
+            ?>
             <div class="soft rounded-2xl p-4 text-center">
-              <div class="font-bold text-sm mb-2">Counter <?php echo $cid; ?></div>
+              <div class="font-bold text-sm mb-1">Counter <?php echo $cid; ?></div>
+              <div class="text-xs font-bold mb-2 <?php echo $isActive ? 'text-emerald-700' : 'text-slate-400'; ?>">
+                ● <?php echo $isActive ? 'Active' : 'Inactive'; ?>
+              </div>
               <div class="text-xs font-bold text-gray-500">NOW SERVING</div>
-              <div id="h-counter-<?php echo $cid; ?>" class="text-2xl font-black text-green-700">
+              <div id="h-counter-<?php echo $cid; ?>" class="text-2xl font-black <?php echo $isActive ? 'text-green-700' : 'text-slate-300'; ?>">
                 <?php echo e($serving['queue_code'] ?? '—'); ?>
               </div>
             </div>
@@ -611,7 +623,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
     </main>
   </div>
 
-  <!-- Floating buttons -->
   <div class="fs">
     <button
       id="fsBtn"
@@ -627,7 +638,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
   </div>
 
   <script>
-    // Update clock every second
     function tickClock() {
       const now = new Date();
       const hh = String(((now.getHours() + 11) % 12) + 1).padStart(2, '0');
@@ -644,7 +654,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
     setInterval(tickClock, 1000);
     tickClock();
 
-    // Fullscreen button
     document.getElementById('fsBtn').addEventListener('click', async () => {
       try {
         if (!document.fullscreenElement) {
@@ -657,7 +666,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
       } catch (e) {}
     });
 
-    // Voice control
     let voiceEnabled = false;
 
     document.getElementById('soundBtn').addEventListener('click', () => {
@@ -674,7 +682,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
       } catch (e) {}
     });
 
-    // Speak helper
     function speak(text) {
       if (!voiceEnabled) return;
 
@@ -686,14 +693,12 @@ function serving_for_counter(array $rows, int $counterId): ?array
       } catch (e) {}
     }
 
-    // Save last spoken codes
     const last = {
       M: null,
       H: null,
       P: null
     };
 
-    // Add flash effect to section
     function flashSection(id) {
       const el = document.getElementById(id);
       if (!el) return;
@@ -703,7 +708,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
       el.classList.add('flash');
     }
 
-    // Build counter map
     function servingMap(list) {
       const map = {};
       (list || []).forEach(row => {
@@ -714,7 +718,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
       return map;
     }
 
-    // Update visible board values
     function updateBoard(data) {
       if (data.clock) {
         const clockEl = document.getElementById('clock');
@@ -726,7 +729,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
         if (todayEl) todayEl.textContent = data.today_label;
       }
 
-      // Membership counters
       const mMap = servingMap(data.membership?.serving_list || []);
       [4, 6, 7].forEach(cid => {
         const el = document.getElementById(`m-counter-${cid}`);
@@ -740,7 +742,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
       if (mNextCode) mNextCode.textContent = data.membership?.next?.queue_code || '—';
       if (mNextService) mNextService.textContent = data.membership?.next?.service_name || 'No waiting queue';
 
-      // Hospital counters
       const hMap = servingMap(data.hospitalization?.serving_list || []);
       [8, 9].forEach(cid => {
         const el = document.getElementById(`h-counter-${cid}`);
@@ -754,7 +755,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
       if (hNextCode) hNextCode.textContent = data.hospitalization?.next?.queue_code || '—';
       if (hNextService) hNextService.textContent = data.hospitalization?.next?.service_name || 'No waiting queue';
 
-      // Priority
       const pServingCode = document.getElementById('p-serving-code');
       const pServingCounter = document.getElementById('p-serving-counter');
       const pServingService = document.getElementById('p-serving-service');
@@ -771,7 +771,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
       if (pNextService) pNextService.textContent = data.priority?.next?.service_name || 'No waiting queue';
     }
 
-    // Refresh board data and voice
     async function refresh() {
       try {
         const res = await fetch(`board.php?ajax=1`, {
@@ -781,15 +780,8 @@ function serving_for_counter(array $rows, int $counterId): ?array
 
         const data = await res.json();
 
-        // Save current values before update
-        const oldM = document.getElementById('m-next-code')?.textContent || '—';
-        const oldH = document.getElementById('h-next-code')?.textContent || '—';
-        const oldP = document.getElementById('p-serving-code')?.textContent || '—';
-
-        // Update board on screen
         updateBoard(data);
 
-        // Current serving values after update
         const mServing = data.membership?.serving_main?.queue_code || '—';
         const mServingCounter = data.membership?.serving_main?.counter_id ?
           `Counter ${data.membership.serving_main.counter_id}` :
@@ -802,7 +794,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
 
         const pServing = data.priority?.serving_main?.queue_code || '—';
 
-        // Voice for membership
         if (mServing !== last.M && mServing !== '—') {
           last.M = mServing;
           flashSection('membershipSection');
@@ -811,7 +802,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
           last.M = null;
         }
 
-        // Voice for hospitalization
         if (hServing !== last.H && hServing !== '—') {
           last.H = hServing;
           flashSection('hospitalSection');
@@ -820,7 +810,6 @@ function serving_for_counter(array $rows, int $counterId): ?array
           last.H = null;
         }
 
-        // Voice for priority
         if (pServing !== last.P && pServing !== '—') {
           last.P = pServing;
           flashSection('prioritySection');
