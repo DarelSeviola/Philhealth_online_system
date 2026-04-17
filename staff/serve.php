@@ -23,12 +23,12 @@ $currentCounterId = isset($_SESSION['counter_id']) ? (int)$_SESSION['counter_id'
 const PRIORITY_COUNTER = 2;
 const MEMBERSHIP_COUNTERS = [4, 6, 7];
 const BENEFIT_COUNTERS = [8, 9];
+const ONLINE_GRACE_MINUTES = 15;
 
 /* =========================================================
    Queue group helper functions
 ========================================================= */
 
-// Return counters for each group
 function get_group_counters(string $group): array
 {
   if ($group === 'priority') {
@@ -46,7 +46,6 @@ function get_group_counters(string $group): array
   return [];
 }
 
-// Initialize active counters for a group if missing
 function ensure_group_active_counters_initialized(string $group, int $currentCounterId = 0): void
 {
   if (!isset($_SESSION['active_counters']) || !is_array($_SESSION['active_counters'])) {
@@ -59,8 +58,6 @@ function ensure_group_active_counters_initialized(string $group, int $currentCou
 
   $groupCounters = get_group_counters($group);
 
-  // Default: if current counter belongs to this group, make it active initially.
-  // Otherwise, start with no active counters until staff checks them manually.
   if ($currentCounterId > 0 && in_array($currentCounterId, $groupCounters, true)) {
     $_SESSION['active_counters'][$group] = [$currentCounterId];
   } else {
@@ -68,7 +65,6 @@ function ensure_group_active_counters_initialized(string $group, int $currentCou
   }
 }
 
-// Return manually selected active counters for the selected group
 function get_active_group_counters(string $group): array
 {
   $groupCounters = get_group_counters($group);
@@ -85,7 +81,28 @@ function get_active_group_counters(string $group): array
   return $saved;
 }
 
-// Build SQL rules for each group
+/* =========================================================
+   Grace-period rule for reserved online queues
+   - checked in = valid
+   - not checked in but still within grace = still reserved
+   - not checked in and grace expired = skipped automatically
+========================================================= */
+function appointment_validity_sql(string $queueAlias = 'q', string $apptAlias = 'a'): string
+{
+  $mins = (int)ONLINE_GRACE_MINUTES;
+
+  return "
+    (
+      {$queueAlias}.queue_type <> 'appointment'
+      OR {$queueAlias}.checked_in_at IS NOT NULL
+      OR NOW() <= DATE_ADD(TIMESTAMP({$queueAlias}.queue_date, {$apptAlias}.appointment_time), INTERVAL {$mins} MINUTE)
+    )
+  ";
+}
+
+/* =========================================================
+   GROUP RULES
+========================================================= */
 function build_group_guard(string $group): array
 {
   $join = "
@@ -98,17 +115,37 @@ function build_group_guard(string $group): array
   $params = [];
 
   if ($group === 'priority') {
-    $where = "AND a.client_status IN ('Senior Citizen','PWD','Pregnant')";
+    $where = "
+      AND q.queue_type = 'priority'
+      AND q.verification_status = 'approved'
+      AND (
+        q.checked_in_at IS NOT NULL
+        OR (
+          a.source = 'online'
+          AND NOW() <= DATE_ADD(TIMESTAMP(q.queue_date, a.appointment_time), INTERVAL " . ONLINE_GRACE_MINUTES . " MINUTE)
+        )
+      )
+    ";
     return [$join, $where, $types, $params];
   }
 
   if ($group === 'membership') {
-    $where = "AND q.category_id = 1 AND (a.client_status IS NULL OR a.client_status = 'Regular')";
+    $where = "
+      AND q.category_id = 1
+      AND q.queue_type IN ('appointment','walkin')
+      AND q.verification_status IN ('not_needed','rejected')
+      AND " . appointment_validity_sql('q', 'a') . "
+    ";
     return [$join, $where, $types, $params];
   }
 
   if ($group === 'hospitalization') {
-    $where = "AND q.category_id = 2 AND (a.client_status IS NULL OR a.client_status = 'Regular')";
+    $where = "
+      AND q.category_id = 2
+      AND q.queue_type IN ('appointment','walkin')
+      AND q.verification_status IN ('not_needed','rejected')
+      AND " . appointment_validity_sql('q', 'a') . "
+    ";
     return [$join, $where, $types, $params];
   }
 
@@ -116,7 +153,44 @@ function build_group_guard(string $group): array
   return [$join, $where, $types, $params];
 }
 
-// Count waiting clients in one queue group
+/* =========================================================
+   ORDERING RULES
+   Option A:
+   - appointment before walkin
+   - lower queue_number first
+   - no check-in-time priority over reserved online number
+========================================================= */
+function build_group_order_sql(string $group): string
+{
+  if ($group === 'priority') {
+    return "
+      ORDER BY
+        CASE
+          WHEN a.source = 'online' THEN 1
+          WHEN a.source = 'walkin' THEN 2
+          ELSE 3
+        END,
+        q.queue_number ASC,
+        q.created_at ASC
+    ";
+  }
+
+  if ($group === 'membership' || $group === 'hospitalization') {
+    return "
+      ORDER BY
+        CASE
+          WHEN q.queue_type = 'appointment' THEN 1
+          WHEN q.queue_type = 'walkin' THEN 2
+          ELSE 3
+        END,
+        q.queue_number ASC,
+        q.created_at ASC
+    ";
+  }
+
+  return "ORDER BY q.queue_number ASC, q.created_at ASC";
+}
+
 function get_group_waiting_count(mysqli $conn, string $today, string $group): int
 {
   [$guardJoin, $guardWhere, $guardTypes, $guardParams] = build_group_guard($group);
@@ -147,7 +221,74 @@ function get_group_waiting_count(mysqli $conn, string $today, string $group): in
   return $count;
 }
 
-// Find first free active counter in selected group
+function get_pending_priority_count(mysqli $conn, string $today): int
+{
+  $stmt = $conn->prepare("
+    SELECT COUNT(*) AS c
+    FROM queue
+    WHERE queue_date = ?
+      AND status = 'waiting'
+      AND queue_type = 'priority'
+      AND verification_status = 'pending'
+  ");
+  if (!$stmt) {
+    return 0;
+  }
+
+  $stmt->bind_param("s", $today);
+  $stmt->execute();
+  $count = (int)($stmt->get_result()->fetch_assoc()['c'] ?? 0);
+  $stmt->close();
+
+  return $count;
+}
+
+function get_pending_priority_list(mysqli $conn, string $today): array
+{
+  $stmt = $conn->prepare("
+    SELECT
+      q.queue_id,
+      q.queue_code,
+      q.priority_status,
+      q.checked_in_at,
+      q.appointment_id,
+      a.walkin_name,
+      a.client_status,
+      a.source,
+      a.appointment_time,
+      q.category_id,
+      qc.category_name,
+      COALESCE(s.service_name, '—') AS service_name
+    FROM queue q
+    LEFT JOIN appointments a ON a.appointment_id = q.appointment_id
+    LEFT JOIN queue_categories qc ON qc.category_id = q.category_id
+    LEFT JOIN services s ON s.service_id = q.service_id
+    WHERE q.queue_date = ?
+      AND q.status = 'waiting'
+      AND q.queue_type = 'priority'
+      AND q.verification_status = 'pending'
+    ORDER BY
+      CASE
+        WHEN a.source = 'online' THEN 1
+        WHEN a.source = 'walkin' THEN 2
+        ELSE 3
+      END,
+      q.queue_number ASC,
+      q.created_at ASC
+  ");
+
+  if (!$stmt) {
+    return [];
+  }
+
+  $stmt->bind_param("s", $today);
+  $stmt->execute();
+  $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+  $stmt->close();
+
+  return $rows ?: [];
+}
+
 function get_first_free_counter(mysqli $conn, string $today, string $group): ?int
 {
   $counters = get_active_group_counters($group);
@@ -181,7 +322,6 @@ function get_first_free_counter(mysqli $conn, string $today, string $group): ?in
   return null;
 }
 
-// Count how many active counters are currently serving in this group
 function get_group_serving_count(mysqli $conn, string $today, string $group): int
 {
   [$guardJoin, $guardWhere, $guardTypes, $guardParams] = build_group_guard($group);
@@ -218,7 +358,6 @@ function get_group_serving_count(mysqli $conn, string $today, string $group): in
   return (int)($row['c'] ?? 0);
 }
 
-// Get one current serving queue in selected group (oldest among active counters)
 function get_group_serving(mysqli $conn, string $today, string $group): ?array
 {
   [$guardJoin, $guardWhere, $guardTypes, $guardParams] = build_group_guard($group);
@@ -231,16 +370,23 @@ function get_group_serving(mysqli $conn, string $today, string $group): ?array
   $placeholders = implode(',', array_fill(0, count($counters), '?'));
   $types = "s" . str_repeat("i", count($counters)) . $guardTypes;
   $params = array_merge([$today], array_map('intval', $counters), $guardParams);
+  $orderSql = build_group_order_sql($group);
 
   $sql = "
     SELECT
       q.queue_id,
       q.appointment_id,
       q.queue_code,
+      q.queue_number,
       q.category_id,
       q.counter_id,
+      q.queue_type,
+      q.priority_status,
+      q.verification_status,
       qc.category_name,
-      COALESCE(s.service_name, '') AS service_name
+      COALESCE(s.service_name, '') AS service_name,
+      a.source,
+      a.appointment_time
     FROM queue q
     JOIN queue_categories qc ON qc.category_id = q.category_id
     $guardJoin
@@ -248,7 +394,7 @@ function get_group_serving(mysqli $conn, string $today, string $group): ?array
       AND q.counter_id IN ($placeholders)
       AND q.status = 'serving'
       $guardWhere
-    ORDER BY q.created_at ASC
+    $orderSql
     LIMIT 1
   ";
 
@@ -265,25 +411,32 @@ function get_group_serving(mysqli $conn, string $today, string $group): ?array
   return $row ?: null;
 }
 
-// Get waiting list in selected group
 function get_group_waiting_list(mysqli $conn, string $today, string $group): array
 {
   [$guardJoin, $guardWhere, $guardTypes, $guardParams] = build_group_guard($group);
+  $orderSql = build_group_order_sql($group);
 
   $sql = "
     SELECT
       q.queue_id,
       q.queue_code,
+      q.queue_number,
+      q.queue_type,
+      q.priority_status,
+      q.verification_status,
+      q.checked_in_at,
       q.created_at,
       qc.category_name,
-      COALESCE(s.service_name, '—') AS service_name
+      COALESCE(s.service_name, '—') AS service_name,
+      a.source,
+      a.appointment_time
     FROM queue q
     JOIN queue_categories qc ON qc.category_id = q.category_id
     $guardJoin
     WHERE q.queue_date = ?
       AND q.status = 'waiting'
       $guardWhere
-    ORDER BY q.created_at ASC
+    $orderSql
     LIMIT 30
   ";
 
@@ -304,7 +457,6 @@ function get_group_waiting_list(mysqli $conn, string $today, string $group): arr
   return $rows ?: [];
 }
 
-// Return live summary for the selected group
 function get_group_live_summary(mysqli $conn, string $today, string $group): array
 {
   $allCounters = get_group_counters($group);
@@ -339,7 +491,6 @@ if (!in_array($selectedQueueGroup, ['priority', 'membership', 'hospitalization']
   $_SESSION['selected_queue_group'] = $selectedQueueGroup;
 }
 
-// Ensure active counters exist for all groups
 ensure_group_active_counters_initialized('priority', $currentCounterId);
 ensure_group_active_counters_initialized('membership', $currentCounterId);
 ensure_group_active_counters_initialized('hospitalization', $currentCounterId);
@@ -348,7 +499,6 @@ ensure_group_active_counters_initialized('hospitalization', $currentCounterId);
    AJAX requests
 ========================================================= */
 
-// Return waiting list
 if (isset($_GET['ajax']) && $_GET['ajax'] === 'queue') {
   header('Content-Type: application/json; charset=utf-8');
 
@@ -362,7 +512,6 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'queue') {
   exit();
 }
 
-// Return one current serving queue
 if (isset($_GET['ajax']) && $_GET['ajax'] === 'serving') {
   header('Content-Type: application/json; charset=utf-8');
 
@@ -376,7 +525,6 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'serving') {
   exit();
 }
 
-// Return live summary for button logic and counters
 if (isset($_GET['ajax']) && $_GET['ajax'] === 'summary') {
   header('Content-Type: application/json; charset=utf-8');
 
@@ -405,24 +553,21 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'summary') {
    Flash messages and selected queue group
 ========================================================= */
 
-// Flash messages
 $success = $_SESSION['success'] ?? '';
 $error   = $_SESSION['error'] ?? '';
 unset($_SESSION['success'], $_SESSION['error']);
 
-// Waiting counts per group
 $priorityWaiting   = get_group_waiting_count($conn, $today, 'priority');
 $membershipWaiting = get_group_waiting_count($conn, $today, 'membership');
 $hospitalWaiting   = get_group_waiting_count($conn, $today, 'hospitalization');
+$pendingPriorityCount = get_pending_priority_count($conn, $today);
 
-// Current selected queue group
 $selectedQueueGroup = $_SESSION['selected_queue_group'] ?? 'membership';
 if (!in_array($selectedQueueGroup, ['priority', 'membership', 'hospitalization'], true)) {
   $selectedQueueGroup = 'membership';
   $_SESSION['selected_queue_group'] = $selectedQueueGroup;
 }
 
-// Name for selected queue group
 $selectedGroupName = 'Membership';
 if ($selectedQueueGroup === 'priority') {
   $selectedGroupName = 'Priority';
@@ -433,6 +578,7 @@ if ($selectedQueueGroup === 'priority') {
 $initialSummary = get_group_live_summary($conn, $today, $selectedQueueGroup);
 $selectedGroupCounters = get_group_counters($selectedQueueGroup);
 $selectedActiveCounters = get_active_group_counters($selectedQueueGroup);
+$pendingPriorityList = get_pending_priority_list($conn, $today);
 
 /* =========================================================
    Form actions
@@ -442,7 +588,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
   $action = $_POST['action'] ?? '';
 
-  // Change queue group
   if ($action === 'set_group') {
     $newGroup = trim((string)($_POST['queue_group'] ?? ''));
 
@@ -458,7 +603,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     exit();
   }
 
-  // Save manual active counters
   if ($action === 'set_active_counters') {
     $group = $_SESSION['selected_queue_group'] ?? 'membership';
     $allowed = get_group_counters($group);
@@ -485,6 +629,149 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     exit();
   }
 
+  if ($action === 'approve_priority') {
+    $queueId = (int)($_POST['queue_id'] ?? 0);
+
+    $conn->begin_transaction();
+    try {
+      $staffId = (int)($_SESSION['user_id'] ?? 0);
+
+      $stmt = $conn->prepare("
+        UPDATE queue
+        SET verification_status = 'approved',
+            verified_by = ?,
+            verified_at = NOW()
+        WHERE queue_id = ?
+          AND queue_type = 'priority'
+          AND verification_status = 'pending'
+      ");
+      if (!$stmt) {
+        throw new Exception("Failed to prepare approve request.");
+      }
+
+      $stmt->bind_param("ii", $staffId, $queueId);
+      $stmt->execute();
+
+      if ($stmt->affected_rows !== 1) {
+        $stmt->close();
+        throw new Exception("Priority request could not be approved.");
+      }
+      $stmt->close();
+
+      $stmt = $conn->prepare("
+        SELECT queue_code, category_id, appointment_id
+        FROM queue
+        WHERE queue_id = ?
+        LIMIT 1
+      ");
+      $stmt->bind_param("i", $queueId);
+      $stmt->execute();
+      $row = $stmt->get_result()->fetch_assoc();
+      $stmt->close();
+
+      log_audit(
+        $conn,
+        'approve_priority',
+        "Priority request approved",
+        $queueId,
+        $row['queue_code'] ?? null,
+        isset($row['category_id']) ? (int)$row['category_id'] : null,
+        null,
+        !empty($row['appointment_id']) ? (int)$row['appointment_id'] : null
+      );
+
+      $conn->commit();
+      $_SESSION['success'] = "Priority request approved.";
+    } catch (Exception $e) {
+      $conn->rollback();
+      $_SESSION['error'] = $e->getMessage();
+    }
+
+    header("Location: serve.php");
+    exit();
+  }
+
+  if ($action === 'reject_priority') {
+    $queueId = (int)($_POST['queue_id'] ?? 0);
+
+    $conn->begin_transaction();
+    try {
+      $staffId = (int)($_SESSION['user_id'] ?? 0);
+
+      $stmt = $conn->prepare("
+        SELECT q.queue_id, q.appointment_id, q.queue_code, q.category_id, a.source
+        FROM queue q
+        LEFT JOIN appointments a ON a.appointment_id = q.appointment_id
+        WHERE q.queue_id = ?
+          AND q.queue_type = 'priority'
+          AND q.verification_status = 'pending'
+        LIMIT 1
+        FOR UPDATE
+      ");
+      if (!$stmt) {
+        throw new Exception("Failed to load priority request.");
+      }
+
+      $stmt->bind_param("i", $queueId);
+      $stmt->execute();
+      $row = $stmt->get_result()->fetch_assoc();
+      $stmt->close();
+
+      if (!$row) {
+        throw new Exception("Priority request not found.");
+      }
+
+      $newType = (($row['source'] ?? 'walkin') === 'online') ? 'appointment' : 'walkin';
+      $categoryId = (int)$row['category_id'];
+
+      $newPrefix = ($categoryId === 1) ? 'M' : 'B';
+
+      $stmt = $conn->prepare("
+        UPDATE queue
+        SET queue_type = ?,
+            prefix = ?,
+            queue_code = CONCAT(?, LPAD(queue_number, 3, '0')),
+            priority_status = 'none',
+            verification_status = 'rejected',
+            verified_by = ?,
+            verified_at = NOW()
+        WHERE queue_id = ?
+      ");
+      if (!$stmt) {
+        throw new Exception("Failed to reject priority request.");
+      }
+
+      $stmt->bind_param("sssii", $newType, $newPrefix, $newPrefix, $staffId, $queueId);
+      $stmt->execute();
+
+      if ($stmt->affected_rows < 1) {
+        $stmt->close();
+        throw new Exception("Priority request could not be rejected.");
+      }
+      $stmt->close();
+
+      log_audit(
+        $conn,
+        'reject_priority',
+        "Priority request rejected; reverted to {$newType}",
+        $queueId,
+        $row['queue_code'] ?? null,
+        $categoryId,
+        null,
+        !empty($row['appointment_id']) ? (int)$row['appointment_id'] : null
+      );
+
+      $conn->commit();
+      $_SESSION['success'] = "Priority request rejected.";
+    } catch (Exception $e) {
+      $conn->rollback();
+      $_SESSION['error'] = $e->getMessage();
+    }
+
+    header("Location: serve.php");
+    exit();
+  }
+
   $group = $_SESSION['selected_queue_group'] ?? 'membership';
 
   if (!in_array($action, ['call_next', 'mark_done'], true)) {
@@ -503,22 +790,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   $conn->begin_transaction();
 
   try {
-    // Call next client
     if ($action === 'call_next') {
       [$guardJoin, $guardWhere, $guardTypes, $guardParams] = build_group_guard($group);
+      $orderSql = build_group_order_sql($group);
 
       $sql = "
         SELECT
           q.queue_id,
           q.appointment_id,
           q.queue_code,
-          q.category_id
+          q.queue_number,
+          q.category_id,
+          q.queue_type,
+          q.priority_status,
+          q.verification_status
         FROM queue q
         $guardJoin
         WHERE q.queue_date = ?
           AND q.status = 'waiting'
           $guardWhere
-        ORDER BY q.created_at ASC
+        $orderSql
         LIMIT 1
         FOR UPDATE
       ";
@@ -568,7 +859,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $stmt->close();
         throw new Exception("Queue was already processed by another staff.");
       }
-
       $stmt->close();
 
       if ($aid !== null) {
@@ -598,7 +888,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       $_SESSION['success'] = "Now serving: " . $next['queue_code'] . " at Counter " . $freeCounter;
     }
 
-    // Mark one current serving as done among active counters
     if ($action === 'mark_done') {
       $serving = get_group_serving($conn, $today, $group);
 
@@ -629,7 +918,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $stmt->close();
         throw new Exception("Serving queue could not be completed.");
       }
-
       $stmt->close();
 
       if ($aid !== null) {
@@ -893,10 +1181,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <div class="rounded-3xl border border-white/40 bg-white/75 backdrop-blur shadow-sm p-5">
           <div class="text-sm font-extrabold">Quick Rules</div>
           <ul class="mt-2 text-sm text-slate-600 space-y-1 list-disc pl-5">
-            <li>FCFS by queue group</li>
+            <li>Online bookings stay ahead of walk-ins</li>
+            <li>Lower reserved queue number is served first within the same type</li>
+            <li>If an online client misses the grace period, the system proceeds to the next client</li>
+            <li>Approved special-lane clients are handled only in Counter 2</li>
             <li>Staff manually sets which counters are active or inactive</li>
-            <li>Only active counters receive the next queue</li>
-            <li>Mark Done completes one active serving queue in the group</li>
           </ul>
         </div>
       </section>
@@ -915,6 +1204,56 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             </span>
           </div>
         </div>
+
+        <?php if ($selectedQueueGroup === 'priority' && !empty($pendingPriorityList)): ?>
+          <div class="mt-4 rounded-2xl border border-amber-200 bg-amber-50/80 p-4">
+            <div class="flex items-center justify-between gap-3">
+              <div>
+                <div class="text-sm font-extrabold text-amber-800">Pending Priority Verification</div>
+                <div class="text-xs text-amber-700"><?php echo (int)$pendingPriorityCount; ?> request(s) awaiting approval</div>
+              </div>
+            </div>
+
+            <div class="mt-4 space-y-3">
+              <?php foreach ($pendingPriorityList as $row): ?>
+                <div class="rounded-xl border border-amber-200 bg-white/80 p-4 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+                  <div>
+                    <div class="text-lg font-extrabold text-slate-900"><?php echo e($row['queue_code']); ?></div>
+                    <div class="text-xs font-bold uppercase text-slate-500"><?php echo e($row['category_name'] ?? ''); ?></div>
+                    <div class="mt-1 text-sm font-semibold text-slate-700"><?php echo e($row['service_name'] ?? ''); ?></div>
+                    <div class="mt-1 text-sm text-amber-700 font-bold">
+                      Claimed status: <?php echo e($row['priority_status'] ?? ''); ?>
+                    </div>
+                  </div>
+
+                  <div class="flex items-center gap-2">
+                    <form method="POST">
+                      <?php echo csrf_field(); ?>
+                      <input type="hidden" name="action" value="approve_priority">
+                      <input type="hidden" name="queue_id" value="<?php echo (int)$row['queue_id']; ?>">
+                      <button
+                        type="submit"
+                        class="rounded-xl bg-emerald-600 hover:opacity-95 text-white px-4 py-2 text-sm font-extrabold transition">
+                        Approve
+                      </button>
+                    </form>
+
+                    <form method="POST">
+                      <?php echo csrf_field(); ?>
+                      <input type="hidden" name="action" value="reject_priority">
+                      <input type="hidden" name="queue_id" value="<?php echo (int)$row['queue_id']; ?>">
+                      <button
+                        type="submit"
+                        class="rounded-xl bg-rose-600 hover:opacity-95 text-white px-4 py-2 text-sm font-extrabold transition">
+                        Reject
+                      </button>
+                    </form>
+                  </div>
+                </div>
+              <?php endforeach; ?>
+            </div>
+          </div>
+        <?php endif; ?>
 
         <div class="mt-4">
           <div id="queueList" class="space-y-2">
@@ -985,13 +1324,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       const code = (q.queue_code ?? '').toString();
       const cat = (q.category_name ?? '').toString();
       const svc = (q.service_name ?? '').toString();
+      const type = (q.queue_type ?? '').toString();
+      const source = (q.source ?? '').toString();
+      const slot = (q.appointment_time ?? '').toString();
+
+      let typeBadge = '';
+      if (type === 'priority') {
+        typeBadge += '<span class="ml-2 text-[10px] font-extrabold px-2 py-1 rounded-full bg-amber-100 text-amber-800 border border-amber-200">PRIORITY</span>';
+      } else if (type === 'appointment') {
+        typeBadge += '<span class="ml-2 text-[10px] font-extrabold px-2 py-1 rounded-full bg-blue-100 text-blue-800 border border-blue-200">APPOINTMENT</span>';
+      } else if (type === 'walkin') {
+        typeBadge += '<span class="ml-2 text-[10px] font-extrabold px-2 py-1 rounded-full bg-slate-100 text-slate-700 border border-slate-200">WALK-IN</span>';
+      }
+
+      let sourceBadge = '';
+      if (source === 'online') {
+        sourceBadge = '<span class="ml-2 text-[10px] font-extrabold px-2 py-1 rounded-full bg-indigo-100 text-indigo-800 border border-indigo-200">ONLINE</span>';
+      } else if (source === 'walkin') {
+        sourceBadge = '<span class="ml-2 text-[10px] font-extrabold px-2 py-1 rounded-full bg-gray-100 text-gray-700 border border-gray-200">WALK-IN</span>';
+      }
+
+      const slotText = slot ? `<div class="mt-1 text-xs font-bold text-emerald-700">SLOT: ${slot}</div>` : '';
 
       return `
         <div class="flex items-center justify-between rounded-2xl border border-white/60 bg-white/80 p-4 hover:bg-white transition">
           <div class="min-w-0">
-            <div class="text-lg font-extrabold tracking-tight text-slate-900">${code}</div>
+            <div class="text-lg font-extrabold tracking-tight text-slate-900">
+              ${code}${typeBadge}${sourceBadge}
+            </div>
             <div class="mt-0.5 text-xs font-bold text-slate-500 uppercase">${cat}</div>
             ${svc ? `<div class="mt-1 text-sm font-semibold text-slate-700">${svc}</div>` : ``}
+            ${slotText}
           </div>
           <span class="shrink-0 text-xs font-extrabold px-2.5 py-1 rounded-full bg-brand-50 text-brand-700 border border-brand-100">
             #${i + 1}
