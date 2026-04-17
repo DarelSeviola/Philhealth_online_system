@@ -21,13 +21,11 @@ if (!isset($_SESSION['user_id']) || !in_array($_SESSION['role'] ?? '', ['staff',
 const PRIORITY_COUNTER = 2;
 const MEMBERSHIP_CAT_ID = 1;
 const BENEFIT_AVAILMENT_CAT_ID = 2;
+const ONLINE_GRACE_MINUTES = 15;
 
 // Counter groups
 const MEMBERSHIP_COUNTERS = [4, 6, 7];
 const BENEFIT_AVAILMENT_COUNTERS = [8, 9];
-
-// Priority client statuses
-const PRIORITY_STATUSES_SQL = "'Senior Citizen','PWD','Pregnant'";
 
 /* =========================================================
    Counter status from session
@@ -89,7 +87,43 @@ function fetch_all(mysqli $conn, string $sql, string $types, array $params): arr
 }
 
 /* =========================================================
+   Grace / validity logic
+========================================================= */
+
+function board_appointment_validity_sql(string $queueAlias = 'q', string $apptAlias = 'a'): string
+{
+  $mins = (int)ONLINE_GRACE_MINUTES;
+
+  return "
+    (
+      {$queueAlias}.queue_type <> 'appointment'
+      OR {$queueAlias}.checked_in_at IS NOT NULL
+      OR NOW() <= DATE_ADD(TIMESTAMP({$queueAlias}.queue_date, {$apptAlias}.appointment_time), INTERVAL {$mins} MINUTE)
+    )
+  ";
+}
+
+function board_priority_validity_sql(string $queueAlias = 'q', string $apptAlias = 'a'): string
+{
+  $mins = (int)ONLINE_GRACE_MINUTES;
+
+  return "
+    (
+      {$queueAlias}.checked_in_at IS NOT NULL
+      OR (
+        {$apptAlias}.source = 'online'
+        AND NOW() <= DATE_ADD(TIMESTAMP({$queueAlias}.queue_date, {$apptAlias}.appointment_time), INTERVAL {$mins} MINUTE)
+      )
+    )
+  ";
+}
+
+/* =========================================================
    Queue data functions
+   FINAL LOGIC:
+   - online before walk-in
+   - lower queue_number first
+   - skip overdue online reservations automatically
 ========================================================= */
 
 function serving_list_by_counters(
@@ -114,15 +148,50 @@ function serving_list_by_counters(
     $params[] = $category_id;
   }
 
-  $priorityWhere = "";
+  $extraWhere = "";
+  $orderSql = "";
+
   if ($priorityOnly) {
-    $priorityWhere = " AND a.client_status IN (" . PRIORITY_STATUSES_SQL . ") ";
+    $extraWhere = "
+      AND q.queue_type = 'priority'
+      AND q.verification_status = 'approved'
+      AND " . board_priority_validity_sql('q', 'a') . "
+    ";
+    $orderSql = "
+      ORDER BY
+        CASE
+          WHEN a.source = 'online' THEN 1
+          WHEN a.source = 'walkin' THEN 2
+          ELSE 3
+        END,
+        q.queue_number ASC,
+        q.created_at ASC
+    ";
+  } else {
+    $extraWhere = "
+      AND q.queue_type IN ('appointment','walkin')
+      AND " . board_appointment_validity_sql('q', 'a') . "
+    ";
+    $orderSql = "
+      ORDER BY
+        CASE
+          WHEN q.queue_type = 'appointment' THEN 1
+          WHEN q.queue_type = 'walkin' THEN 2
+          ELSE 3
+        END,
+        q.queue_number ASC,
+        q.created_at ASC
+    ";
   }
 
   $sql = "
     SELECT
       q.queue_code,
+      q.queue_number,
       q.counter_id,
+      q.queue_type,
+      a.source,
+      a.appointment_time,
       COALESCE(s.service_name, '—') AS service_name
     FROM queue q
     LEFT JOIN appointments a ON a.appointment_id = q.appointment_id
@@ -131,8 +200,8 @@ function serving_list_by_counters(
       AND q.status = 'serving'
       AND q.counter_id IN ($placeholders)
       $catSql
-      $priorityWhere
-    ORDER BY q.counter_id ASC, q.created_at ASC
+      $extraWhere
+    $orderSql
   ";
 
   return fetch_all($conn, $sql, $types, $params);
@@ -155,21 +224,52 @@ function next_waiting_overall(
   }
 
   if ($priorityOnly) {
-    $where .= " AND a.client_status IN (" . PRIORITY_STATUSES_SQL . ")";
+    $where .= "
+      AND q.queue_type = 'priority'
+      AND q.verification_status = 'approved'
+      AND " . board_priority_validity_sql('q', 'a') . "
+    ";
+    $orderSql = "
+      ORDER BY
+        CASE
+          WHEN a.source = 'online' THEN 1
+          WHEN a.source = 'walkin' THEN 2
+          ELSE 3
+        END,
+        q.queue_number ASC,
+        q.created_at ASC
+    ";
   } else {
-    $where .= " AND (a.client_status IS NULL OR a.client_status = 'Regular')";
+    $where .= "
+      AND q.queue_type IN ('appointment','walkin')
+      AND " . board_appointment_validity_sql('q', 'a') . "
+    ";
+    $orderSql = "
+      ORDER BY
+        CASE
+          WHEN q.queue_type = 'appointment' THEN 1
+          WHEN q.queue_type = 'walkin' THEN 2
+          ELSE 3
+        END,
+        q.queue_number ASC,
+        q.created_at ASC
+    ";
   }
 
   $sql = "
     SELECT
       q.queue_code,
+      q.queue_number,
       q.counter_id,
+      q.queue_type,
+      a.source,
+      a.appointment_time,
       COALESCE(s.service_name, '—') AS service_name
     FROM queue q
     LEFT JOIN appointments a ON a.appointment_id = q.appointment_id
     LEFT JOIN services s ON s.service_id = a.service_id
     $where
-    ORDER BY q.created_at ASC
+    $orderSql
     LIMIT 1
   ";
 
@@ -363,6 +463,7 @@ function serving_for_counter(array $rows, int $counterId): ?array
       from {
         transform: translateX(0);
       }
+
       to {
         transform: translateX(-50%);
       }
@@ -377,10 +478,12 @@ function serving_for_counter(array $rows, int $counterId): ?array
         transform: scale(1);
         box-shadow: 0 0 0 rgba(0, 0, 0, 0);
       }
+
       20% {
         transform: scale(1.02);
         box-shadow: 0 12px 40px rgba(20, 80, 20, .22);
       }
+
       100% {
         transform: scale(1);
         box-shadow: 0 0 0 rgba(0, 0, 0, 0);
@@ -411,6 +514,7 @@ function serving_for_counter(array $rows, int $counterId): ?array
       .ticker-track {
         animation: none;
       }
+
       .flash {
         animation: none;
       }
@@ -486,8 +590,8 @@ function serving_for_counter(array $rows, int $counterId): ?array
         <div class="grid grid-cols-3 gap-2 mt-4">
           <?php foreach (MEMBERSHIP_COUNTERS as $cid): ?>
             <?php
-              $serving = serving_for_counter($init['membership']['serving_list'], $cid);
-              $isActive = isset($flatActiveCounters[$cid]);
+            $serving = serving_for_counter($init['membership']['serving_list'], $cid);
+            $isActive = isset($flatActiveCounters[$cid]);
             ?>
             <div class="soft rounded-2xl p-4 text-center">
               <div class="font-bold text-sm mb-1">Counter <?php echo $cid; ?></div>
@@ -588,8 +692,8 @@ function serving_for_counter(array $rows, int $counterId): ?array
         <div class="grid grid-cols-2 gap-4 mt-4">
           <?php foreach (BENEFIT_AVAILMENT_COUNTERS as $cid): ?>
             <?php
-              $serving = serving_for_counter($init['hospitalization']['serving_list'], $cid);
-              $isActive = isset($flatActiveCounters[$cid]);
+            $serving = serving_for_counter($init['hospitalization']['serving_list'], $cid);
+            $isActive = isset($flatActiveCounters[$cid]);
             ?>
             <div class="soft rounded-2xl p-4 text-center">
               <div class="font-bold text-sm mb-1">Counter <?php echo $cid; ?></div>
