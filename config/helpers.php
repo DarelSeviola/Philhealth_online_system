@@ -3,7 +3,6 @@
 
 /* =========================================================
    SAFE TEXT OUTPUT
-   Used to safely show text in HTML
 ========================================================= */
 function e(?string $str): string
 {
@@ -12,7 +11,6 @@ function e(?string $str): string
 
 /* =========================================================
    REFERENCE CODE
-   Creates a unique reference code for appointments
 ========================================================= */
 function generate_reference_code($appointment_date)
 {
@@ -22,14 +20,11 @@ function generate_reference_code($appointment_date)
 
 /* =========================================================
    QUEUE CODE FORMAT
-   Example:
-   M2001
-   B2001
 ========================================================= */
 function format_queue_code(string $prefix, int $number): string
 {
   $prefix = strtoupper(trim($prefix));
-  return $prefix . (string)$number;
+  return $prefix . str_pad((string)$number, 3, '0', STR_PAD_LEFT);
 }
 
 /* =========================================================
@@ -42,13 +37,16 @@ function today_date(): string
 
 /* =========================================================
    NORMALIZE CLIENT STATUS
-   Only allow valid client status values
 ========================================================= */
 function normalize_client_status(string $s): string
 {
   $s = trim($s);
 
   $allowed = [
+    'none',
+    'senior',
+    'pwd',
+    'pregnant',
     'Regular',
     'Senior Citizen',
     'PWD',
@@ -56,51 +54,33 @@ function normalize_client_status(string $s): string
     'Special Lane'
   ];
 
-  return in_array($s, $allowed, true) ? $s : 'Regular';
+  return in_array($s, $allowed, true) ? $s : 'none';
 }
 
 /* =========================================================
-   GET CATEGORY PREFIX
-   Gets the queue prefix from queue_categories table
-   Example:
-   Membership = M
-   Benefit Availment = B
+   MAP OLD / NEW STATUS TO PRIORITY TYPE
 ========================================================= */
-function get_category_prefix(mysqli $conn, int $category_id): string
+function map_priority_status(string $client_status): string
 {
-  $stmt = $conn->prepare("
-    SELECT prefix
-    FROM queue_categories
-    WHERE category_id = ?
-      AND is_active = 1
-    LIMIT 1
-  ");
+  $client_status = normalize_client_status($client_status);
 
-  if (!$stmt) {
-    throw new Exception("DB error (prefix): " . $conn->error);
-  }
+  $map = [
+    'none' => 'none',
+    'Regular' => 'none',
+    'senior' => 'senior',
+    'Senior Citizen' => 'senior',
+    'pwd' => 'pwd',
+    'PWD' => 'pwd',
+    'pregnant' => 'pregnant',
+    'Pregnant' => 'pregnant',
+    'Special Lane' => 'pending_special'
+  ];
 
-  $stmt->bind_param("i", $category_id);
-  $stmt->execute();
-  $row = $stmt->get_result()->fetch_assoc();
-  $stmt->close();
-
-  if (!$row) {
-    throw new Exception("Invalid category.");
-  }
-
-  $prefix = strtoupper(trim((string)$row['prefix']));
-
-  if ($prefix === '') {
-    throw new Exception("Category prefix not configured.");
-  }
-
-  return $prefix;
+  return $map[$client_status] ?? 'none';
 }
 
 /* =========================================================
    GET SERVICE INFO
-   Gets service_id and category_id from services table
 ========================================================= */
 function get_service_row(mysqli $conn, int $service_id): array
 {
@@ -136,20 +116,13 @@ function get_service_row(mysqli $conn, int $service_id): array
 
 /* =========================================================
    COUNTER RULES
-   - Special lane clients go directly to Counter 2
-   - Regular clients do not get a fixed counter yet
+   - Priority clients go to Counter 2 only after approval
+   - Appointment and walk-in clients get counter later in serve.php
 ========================================================= */
-function compute_counter_id(mysqli $conn, int $category_id, string $client_status): ?int
+function compute_counter_id(mysqli $conn, int $category_id, string $queue_type, string $verification_status): ?int
 {
-  $client_status = normalize_client_status($client_status);
-
-  if (in_array($client_status, ['Senior Citizen', 'PWD', 'Pregnant', 'Special Lane'], true)) {
+  if ($queue_type === 'priority' && $verification_status === 'approved') {
     return 2;
-  }
-
-  // Regular clients will get counter later when staff clicks Call Next
-  if ($category_id === 1 || $category_id === 2) {
-    return null;
   }
 
   return null;
@@ -157,27 +130,26 @@ function compute_counter_id(mysqli $conn, int $category_id, string $client_statu
 
 /* =========================================================
    COUNTER RULES USING SERVICE
-   Keeps compatibility if other pages pass service_id
 ========================================================= */
-function compute_counter_id_from_service(mysqli $conn, int $service_id, int $category_id, string $client_status): ?int
+function compute_counter_id_from_service(mysqli $conn, int $service_id, int $category_id, string $queue_type, string $verification_status): ?int
 {
   $svc = get_service_row($conn, $service_id);
   $cat = $category_id > 0 ? $category_id : (int)$svc['category_id'];
 
-  return compute_counter_id($conn, $cat, $client_status);
+  return compute_counter_id($conn, $cat, $queue_type, $verification_status);
 }
 
 /* =========================================================
    ALLOCATE NEXT QUEUE NUMBER
-   This is part of FCFS logic.
-   It gets the highest queue number for the day and category,
-   then adds 1.
+   Shared by prefix + date:
+   M = Membership
+   B = Benefit Availment
+   P = Priority
 ========================================================= */
-function allocate_next_queue_number(mysqli $conn, string $queue_date, int $category_id): int
+function allocate_next_queue_number(mysqli $conn, string $queue_date, string $prefix): int
 {
-  $lockKey = "qnum:{$queue_date}:cat{$category_id}";
+  $lockKey = "qnum:{$queue_date}:prefix{$prefix}";
 
-  // Lock queue generation so two users do not get same number
   $stmt = $conn->prepare("SELECT GET_LOCK(?, 10) AS got");
   if (!$stmt) {
     throw new Exception("DB error (GET_LOCK): " . $conn->error);
@@ -193,12 +165,11 @@ function allocate_next_queue_number(mysqli $conn, string $queue_date, int $categ
   }
 
   try {
-    // Get the last queue number for the same date and category
     $stmt = $conn->prepare("
-      SELECT COALESCE(MAX(queue_number), 2000) AS mx
+      SELECT COALESCE(MAX(queue_number), 0) AS mx
       FROM queue
       WHERE queue_date = ?
-        AND category_id = ?
+        AND prefix = ?
       FOR UPDATE
     ");
 
@@ -206,12 +177,11 @@ function allocate_next_queue_number(mysqli $conn, string $queue_date, int $categ
       throw new Exception("DB error (max queue_number): " . $conn->error);
     }
 
-    $stmt->bind_param("si", $queue_date, $category_id);
+    $stmt->bind_param("ss", $queue_date, $prefix);
     $stmt->execute();
-    $mx = (int)($stmt->get_result()->fetch_assoc()['mx'] ?? 2000);
+    $mx = (int)($stmt->get_result()->fetch_assoc()['mx'] ?? 0);
     $stmt->close();
 
-    // Next queue number
     return $mx + 1;
   } finally {
     $rel = $conn->prepare("SELECT RELEASE_LOCK(?)");
@@ -224,8 +194,84 @@ function allocate_next_queue_number(mysqli $conn, string $queue_date, int $categ
 }
 
 /* =========================================================
-   ISSUE QUEUE AT BOOKING OR CHECK-IN
-   This creates the queue record for an appointment
+   DETERMINE QUEUE TYPE + PREFIX
+========================================================= */
+function determine_queue_meta(int $category_id, string $source, string $client_status): array
+{
+  $priority_status = map_priority_status($client_status);
+
+  $queue_type = 'walkin';
+  $verification_status = 'not_needed';
+
+  if ($source === 'online') {
+    $queue_type = 'appointment';
+  }
+
+  if (in_array($priority_status, ['senior', 'pwd', 'pregnant', 'pending_special'], true)) {
+    $queue_type = 'priority';
+    $verification_status = 'pending';
+  }
+
+  if ($queue_type === 'priority') {
+    $prefix = 'P';
+  } elseif ((int)$category_id === 1) {
+    $prefix = 'M';
+  } else {
+    $prefix = 'B';
+  }
+
+  return [
+    'queue_type' => $queue_type,
+    'priority_status' => $priority_status === 'pending_special' ? 'none' : $priority_status,
+    'verification_status' => $verification_status,
+    'prefix' => $prefix,
+  ];
+}
+
+/* =========================================================
+   GET EXISTING QUEUE BY APPOINTMENT
+========================================================= */
+function get_existing_queue_by_appointment(mysqli $conn, int $appointment_id): ?array
+{
+  $stmt = $conn->prepare("
+    SELECT
+      queue_id,
+      appointment_id,
+      service_id,
+      queue_date,
+      category_id,
+      counter_id,
+      prefix,
+      queue_number,
+      queue_code,
+      queue_type,
+      priority_status,
+      verification_status,
+      checked_in_at,
+      status,
+      created_at
+    FROM queue
+    WHERE appointment_id = ?
+    LIMIT 1
+  ");
+
+  if (!$stmt) {
+    throw new Exception("DB error (queue lookup): " . $conn->error);
+  }
+
+  $stmt->bind_param("i", $appointment_id);
+  $stmt->execute();
+  $row = $stmt->get_result()->fetch_assoc();
+  $stmt->close();
+
+  return $row ?: null;
+}
+
+/* =========================================================
+   ISSUE / RESERVE QUEUE
+   - Online booking reserves queue number immediately
+   - Online kiosk check-in reuses the same queue
+   - Walk-in creates queue immediately with checked_in_at = NOW()
 ========================================================= */
 function issue_queue_at_booking(mysqli $conn, int $appointment_id): array
 {
@@ -233,9 +279,8 @@ function issue_queue_at_booking(mysqli $conn, int $appointment_id): array
     throw new Exception("Invalid appointment_id.");
   }
 
-  // Lock the appointment row first
   $stmt = $conn->prepare("
-    SELECT appointment_id, service_id, category_id, counter_id, client_status, appointment_date
+    SELECT appointment_id, service_id, category_id, counter_id, client_status, appointment_date, source
     FROM appointments
     WHERE appointment_id = ?
     LIMIT 1
@@ -257,8 +302,9 @@ function issue_queue_at_booking(mysqli $conn, int $appointment_id): array
 
   $service_id    = (int)$apt['service_id'];
   $category_id   = (int)$apt['category_id'];
-  $client_status = normalize_client_status((string)($apt['client_status'] ?? 'Regular'));
-  $queue_date    = (string)$apt['appointment_date'];
+  $client_status = (string)($apt['client_status'] ?? 'none');
+  $queue_date    = (string)($apt['appointment_date']);
+  $source        = (string)($apt['source'] ?? 'walkin');
 
   if ($service_id <= 0) {
     throw new Exception("Service missing on appointment.");
@@ -268,16 +314,25 @@ function issue_queue_at_booking(mysqli $conn, int $appointment_id): array
     throw new Exception("Appointment date missing.");
   }
 
-  // Validate service and fix missing category if needed
   $svc = get_service_row($conn, $service_id);
   if ($category_id <= 0) {
     $category_id = (int)$svc['category_id'];
   }
 
-  // Special lane gets Counter 2, regular stays null for now
-  $counter_id = compute_counter_id_from_service($conn, $service_id, $category_id, $client_status);
+  $meta = determine_queue_meta($category_id, $source, $client_status);
+  $queue_type = $meta['queue_type'];
+  $priority_status = $meta['priority_status'];
+  $verification_status = $meta['verification_status'];
+  $prefix = $meta['prefix'];
 
-  // Save counter into appointment
+  $counter_id = compute_counter_id_from_service(
+    $conn,
+    $service_id,
+    $category_id,
+    $queue_type,
+    $verification_status
+  );
+
   $up = $conn->prepare("
     UPDATE appointments
     SET counter_id = ?
@@ -292,52 +347,53 @@ function issue_queue_at_booking(mysqli $conn, int $appointment_id): array
   $up->execute();
   $up->close();
 
-  // If queue already exists, return existing queue
-  $stmt = $conn->prepare("
-    SELECT queue_id, queue_date, service_id, category_id, counter_id, prefix, queue_number, queue_code, status, created_at
-    FROM queue
-    WHERE appointment_id = ?
-    LIMIT 1
-    FOR UPDATE
-  ");
-
-  if (!$stmt) {
-    throw new Exception("DB error (queue existing): " . $conn->error);
-  }
-
-  $stmt->bind_param("i", $appointment_id);
-  $stmt->execute();
-  $existing = $stmt->get_result()->fetch_assoc();
-  $stmt->close();
+  $existing = get_existing_queue_by_appointment($conn, $appointment_id);
 
   if ($existing) {
     return [
-      'queue_id'       => (int)$existing['queue_id'],
-      'appointment_id' => $appointment_id,
-      'service_id'     => (int)$existing['service_id'],
-      'queue_date'     => (string)$existing['queue_date'],
-      'category_id'    => (int)$existing['category_id'],
-      'counter_id'     => isset($existing['counter_id']) ? (int)$existing['counter_id'] : null,
-      'prefix'         => (string)$existing['prefix'],
-      'queue_number'   => (int)$existing['queue_number'],
-      'queue_code'     => (string)$existing['queue_code'],
-      'status'         => (string)$existing['status'],
-      'created_at'     => (string)$existing['created_at'],
+      'queue_id'             => (int)$existing['queue_id'],
+      'appointment_id'       => $appointment_id,
+      'service_id'           => (int)$existing['service_id'],
+      'queue_date'           => (string)$existing['queue_date'],
+      'category_id'          => (int)$existing['category_id'],
+      'counter_id'           => isset($existing['counter_id']) ? (int)$existing['counter_id'] : null,
+      'prefix'               => (string)$existing['prefix'],
+      'queue_number'         => (int)$existing['queue_number'],
+      'queue_code'           => (string)$existing['queue_code'],
+      'queue_type'           => (string)$existing['queue_type'],
+      'priority_status'      => (string)$existing['priority_status'],
+      'verification_status'  => (string)$existing['verification_status'],
+      'checked_in_at'        => $existing['checked_in_at'] !== null ? (string)$existing['checked_in_at'] : null,
+      'status'               => (string)$existing['status'],
+      'created_at'           => (string)$existing['created_at'],
     ];
   }
 
-  $prefix = get_category_prefix($conn, $category_id);
-
-  // Retry insert if duplicate queue happens
   for ($attempt = 0; $attempt < 10; $attempt++) {
-    $queue_number = allocate_next_queue_number($conn, $queue_date, $category_id);
-    $queue_code   = format_queue_code($prefix, $queue_number);
+    $queue_number  = allocate_next_queue_number($conn, $queue_date, $prefix);
+    $queue_code    = format_queue_code($prefix, $queue_number);
+    $checked_in_at = ($source === 'online') ? null : date('Y-m-d H:i:s');
 
     $ins = $conn->prepare("
       INSERT INTO queue
-        (appointment_id, service_id, queue_date, category_id, counter_id, prefix, queue_number, queue_code, status, created_at)
+      (
+        appointment_id,
+        service_id,
+        queue_date,
+        category_id,
+        counter_id,
+        prefix,
+        queue_number,
+        queue_code,
+        queue_type,
+        priority_status,
+        verification_status,
+        checked_in_at,
+        status,
+        created_at
+      )
       VALUES
-        (?, ?, ?, ?, ?, ?, ?, ?, 'waiting', NOW())
+      (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'waiting', NOW())
     ");
 
     if (!$ins) {
@@ -345,7 +401,7 @@ function issue_queue_at_booking(mysqli $conn, int $appointment_id): array
     }
 
     $ins->bind_param(
-      "iisiisis",
+      "iisiisisssss",
       $appointment_id,
       $service_id,
       $queue_date,
@@ -353,7 +409,11 @@ function issue_queue_at_booking(mysqli $conn, int $appointment_id): array
       $counter_id,
       $prefix,
       $queue_number,
-      $queue_code
+      $queue_code,
+      $queue_type,
+      $priority_status,
+      $verification_status,
+      $checked_in_at
     );
 
     if ($ins->execute()) {
@@ -361,17 +421,21 @@ function issue_queue_at_booking(mysqli $conn, int $appointment_id): array
       $ins->close();
 
       return [
-        'queue_id'       => $queue_id,
-        'appointment_id' => $appointment_id,
-        'service_id'     => $service_id,
-        'queue_date'     => $queue_date,
-        'category_id'    => $category_id,
-        'counter_id'     => $counter_id,
-        'prefix'         => $prefix,
-        'queue_number'   => $queue_number,
-        'queue_code'     => $queue_code,
-        'status'         => 'waiting',
-        'created_at'     => date('Y-m-d H:i:s'),
+        'queue_id'             => $queue_id,
+        'appointment_id'       => $appointment_id,
+        'service_id'           => $service_id,
+        'queue_date'           => $queue_date,
+        'category_id'          => $category_id,
+        'counter_id'           => $counter_id,
+        'prefix'               => $prefix,
+        'queue_number'         => $queue_number,
+        'queue_code'           => $queue_code,
+        'queue_type'           => $queue_type,
+        'priority_status'      => $priority_status,
+        'verification_status'  => $verification_status,
+        'checked_in_at'        => $checked_in_at,
+        'status'               => 'waiting',
+        'created_at'           => date('Y-m-d H:i:s'),
       ];
     }
 
@@ -391,7 +455,6 @@ function issue_queue_at_booking(mysqli $conn, int $appointment_id): array
 
 /* =========================================================
    SAVE AUDIT LOG
-   Records staff actions into audit_logs table
 ========================================================= */
 function log_audit(
   mysqli $conn,
@@ -404,7 +467,6 @@ function log_audit(
   ?int $appointment_id = null
 ): void {
 
-  // Add client info to details if appointment exists
   if ($appointment_id !== null && $appointment_id > 0) {
     $stmt_apt = $conn->prepare("
       SELECT ap.user_id, ap.walkin_name, ap.client_status, u.full_name
@@ -486,3 +548,4 @@ function log_audit(
 
   $stmt->close();
 }
+
