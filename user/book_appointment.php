@@ -28,28 +28,57 @@ unset($_SESSION['success'], $_SESSION['error']);
 
 // Load active services
 $services = $conn->query("
-  SELECT s.service_id, s.service_name, qc.category_name
+  SELECT s.service_id, s.service_name, qc.category_id, qc.category_name
   FROM services s
   JOIN queue_categories qc ON qc.category_id = s.category_id
   WHERE s.is_active = 1
   ORDER BY qc.category_id, s.service_id
 ");
 
-// Handle form submit
+/* =========================================================
+   HELPERS
+========================================================= */
+
+function map_client_status_label(string $raw): string
+{
+  $raw = trim(strtolower($raw));
+
+  return match ($raw) {
+    'senior' => 'Senior Citizen',
+    'pregnant' => 'Pregnant',
+    'pwd' => 'PWD',
+    default => 'Regular',
+  };
+}
+
+function map_client_status_key(string $label): string
+{
+  $label = trim(strtolower($label));
+
+  return match ($label) {
+    'senior citizen' => 'senior',
+    'pregnant' => 'pregnant',
+    'pwd' => 'pwd',
+    default => 'regular',
+  };
+}
+
+/* =========================================================
+   HANDLE FORM SUBMIT
+========================================================= */
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
   csrf_validate();
 
-  // Get form values
-  $service_id       = (int)($_POST['service_id'] ?? 0);
-  $appointment_date = trim((string)($_POST['appointment_date'] ?? ''));
-  $appointment_time = trim((string)($_POST['appointment_time'] ?? ''));
-  $client_status    = trim((string)($_POST['client_status'] ?? 'Regular'));
+  $service_id         = (int)($_POST['service_id'] ?? 0);
+  $appointment_date   = trim((string)($_POST['appointment_date'] ?? ''));
+  $appointment_time   = trim((string)($_POST['appointment_time'] ?? ''));
+  $client_status_raw  = trim((string)($_POST['client_status'] ?? 'regular'));
+  $client_status      = map_client_status_label($client_status_raw);
 
   /* =========================================================
-   BLOCK SATURDAY AND SUNDAY
-========================================================= */
+     BLOCK SATURDAY AND SUNDAY
+  ========================================================= */
   $dayOfWeek = date('N', strtotime($appointment_date)); // 6 = Saturday, 7 = Sunday
-
   if ($dayOfWeek >= 6) {
     $_SESSION['error'] = "Appointments are only allowed from Monday to Friday.";
     header("Location: book_appointment.php");
@@ -57,28 +86,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
   }
 
   /* =========================================================
-   BLOCK TIME THAT ALREADY PASSED
-========================================================= */
+     BLOCK TIME THAT ALREADY PASSED
+  ========================================================= */
   if ($appointment_date === $today) {
+    $slotStart = strtotime($appointment_date . ' ' . $appointment_time);
+    $slotEnd   = strtotime('+1 hour', $slotStart);
+    $currentDateTime = time();
 
-    $selectedDateTime = strtotime($appointment_date . ' ' . $appointment_time);
-    $currentDateTime  = time();
-
-    if ($selectedDateTime <= $currentDateTime) {
-      $_SESSION['error'] = "The selected appointment time has already passed. Please choose a later time.";
+    // Block only if the whole slot already ended
+    if ($slotEnd <= $currentDateTime) {
+      $_SESSION['error'] = "The selected appointment time has already ended. Please choose another available slot.";
       header("Location: book_appointment.php");
       exit();
     }
   }
 
-  // Check required fields
   if ($service_id <= 0 || $appointment_date === '' || $appointment_time === '') {
     $_SESSION['error'] = "Please complete all required fields.";
     header("Location: book_appointment.php");
     exit();
   }
 
-  // Check date format
   $d = DateTime::createFromFormat('Y-m-d', $appointment_date);
   if (!$d || $d->format('Y-m-d') !== $appointment_date) {
     $_SESSION['error'] = "Invalid appointment date.";
@@ -86,23 +114,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
     exit();
   }
 
-  // Do not allow past dates
   if ($appointment_date < $today) {
     $_SESSION['error'] = "Cannot book appointments in the past.";
     header("Location: book_appointment.php");
     exit();
   }
 
-  // Check time format
-  $t = DateTime::createFromFormat('H:i', $appointment_time);
-  if (!$t || $t->format('H:i') !== $appointment_time) {
+  $t = DateTime::createFromFormat('H:i:s', $appointment_time);
+  if (!$t) {
+    $t = DateTime::createFromFormat('H:i', $appointment_time);
+  }
+  if (!$t) {
     $_SESSION['error'] = "Invalid appointment time.";
     header("Location: book_appointment.php");
     exit();
   }
 
-  // Allow only office hours
-  if ($appointment_time < "08:00" || $appointment_time > "17:00") {
+  $appointment_time_db = $t->format('H:i:s');
+
+  if ($appointment_time_db < "08:00:00" || $appointment_time_db > "17:00:00") {
     $_SESSION['error'] = "Appointment time must be within office hours (08:00 - 17:00).";
     header("Location: book_appointment.php");
     exit();
@@ -126,11 +156,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
     exit();
   }
 
-  // Get category and counter
   $category_id = (int)$service['category_id'];
-  $counter_id = compute_counter_id_from_service($conn, $service_id, $category_id, $client_status);
 
-  // Check duplicate booking on same date and service
+  // Keep counter NULL for booked users; counter is assigned later in serve.php
+  $counter_id = null;
+
+  // Duplicate same service / same date
   $stmt = $conn->prepare("
     SELECT appointment_id
     FROM appointments
@@ -149,15 +180,85 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
     exit();
   }
 
-  // Save booking
+  /* =========================================================
+     SLOT AVAILABILITY CHECK
+  ========================================================= */
+  $client_type_key = map_client_status_key($client_status);
+
+  $stmt = $conn->prepare("
+    SELECT
+      l.max_capacity,
+      COUNT(a.appointment_id) AS booked_count
+    FROM appointment_slot_limits l
+    LEFT JOIN appointments a
+      ON a.category_id = l.category_id
+      AND a.appointment_date = ?
+      AND a.appointment_time = l.slot_time
+      AND a.status IN ('booked', 'checked_in')
+      AND (
+        CASE
+          WHEN a.client_status = 'Senior Citizen' THEN 'senior'
+          WHEN a.client_status = 'Pregnant' THEN 'pregnant'
+          WHEN a.client_status = 'PWD' THEN 'pwd'
+          ELSE 'regular'
+        END
+      ) = l.client_type
+    WHERE l.category_id = ?
+      AND l.client_type = ?
+      AND l.slot_time = ?
+    GROUP BY l.max_capacity
+    LIMIT 1
+  ");
+  $stmt->bind_param("siss", $appointment_date, $category_id, $client_type_key, $appointment_time_db);
+  $stmt->execute();
+  $slotRow = $stmt->get_result()->fetch_assoc();
+  $stmt->close();
+
+  if (!$slotRow) {
+    $_SESSION['error'] = "The selected time slot is not configured for this service or client status.";
+    header("Location: book_appointment.php");
+    exit();
+  }
+
+  if ((int)$slotRow['booked_count'] >= (int)$slotRow['max_capacity']) {
+    $_SESSION['error'] = "This time slot is no longer available. Please choose another time.";
+    header("Location: book_appointment.php");
+    exit();
+  }
+
+  // Limit online client to maximum of 3 bookings for the same date
+  $stmt = $conn->prepare("
+    SELECT COUNT(*) AS total_bookings
+    FROM appointments
+    WHERE user_id = ?
+      AND appointment_date = ?
+      AND status IN ('booked', 'checked_in')
+  ");
+  $stmt->bind_param("is", $user_id, $appointment_date);
+  $stmt->execute();
+  $row = $stmt->get_result()->fetch_assoc();
+  $stmt->close();
+
+  if ((int)($row['total_bookings'] ?? 0) >= 3) {
+    $_SESSION['error'] = "You have already reached the maximum of 3 bookings for this date.";
+    header("Location: book_appointment.php");
+    exit();
+  }
+
+  /* =========================================================
+     SAVE BOOKING + RESERVE QUEUE NUMBER
+  ========================================================= */
   $conn->begin_transaction();
 
   try {
-    // Make unique reference code
     $reference_code = generate_reference_code($appointment_date);
 
     for ($i = 0; $i < 5; $i++) {
       $chk = $conn->prepare("SELECT appointment_id FROM appointments WHERE reference_code = ? LIMIT 1");
+      if (!$chk) {
+        throw new Exception("Failed to validate reference code.");
+      }
+
       $chk->bind_param("s", $reference_code);
       $chk->execute();
       $exists = $chk->get_result()->num_rows > 0;
@@ -166,6 +267,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
       if (!$exists) {
         break;
       }
+
       $reference_code = generate_reference_code($appointment_date);
     }
 
@@ -176,6 +278,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
       VALUES
         (?, ?, ?, ?, ?, ?, ?, ?, 'online', 'booked')
     ");
+    if (!$stmt) {
+      throw new Exception("Failed to prepare appointment insert.");
+    }
+
     $stmt->bind_param(
       "siiiisss",
       $reference_code,
@@ -185,15 +291,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
       $counter_id,
       $client_status,
       $appointment_date,
-      $appointment_time
+      $appointment_time_db
     );
     $stmt->execute();
     $appointment_id = (int)$conn->insert_id;
     $stmt->close();
 
+    // Reserve queue number immediately for online booking
+    $q = issue_queue_at_booking($conn, $appointment_id);
+
+    log_audit(
+      $conn,
+      'book_appointment',
+      'Appointment booked successfully',
+      $q['queue_id'] ?? null,
+      $q['queue_code'] ?? null,
+      $category_id,
+      null,
+      $appointment_id
+    );
+
     $conn->commit();
 
-    $_SESSION['success'] = "Appointment booked successfully! Reference Code: $reference_code. Please check-in at the kiosk on your appointment date.";
+    $_SESSION['success'] = "Appointment booked successfully! Reference Code: {$reference_code}. Your reserved queue number is {$q['queue_code']}. Please check-in at the kiosk on your appointment date.";
     header("Location: book_appointment.php");
     exit();
   } catch (Throwable $e) {
@@ -202,36 +322,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
     header("Location: book_appointment.php");
     exit();
   }
-  log_audit(
-    $conn,
-    'book_appointment',
-    'Appointment booked successfully',
-    null,
-    null,
-    $category_id,
-    null,
-    $appointment_id
-  );
 }
 ?>
 <!DOCTYPE html>
 <html lang="en">
 
 <head>
-  <!-- Basic page setup -->
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Book Appointment — PhilHealth</title>
 
-  <!-- Tailwind -->
   <script src="https://cdn.tailwindcss.com"></script>
 
-  <!-- Font -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 
-  <!-- Page styles -->
   <style>
     :root {
       --g-dark: #1a4d2e;
@@ -276,7 +382,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
       pointer-events: none;
     }
 
-    /* Header */
     header {
       border-bottom: 1px solid rgba(255, 255, 255, 0.40);
       background: rgba(255, 255, 255, 0.20);
@@ -320,7 +425,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
       opacity: .65;
     }
 
-    /* Main layout */
     main {
       max-width: 720px;
       margin: 0 auto;
@@ -358,7 +462,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
       color: var(--t-soft);
     }
 
-    /* Alert messages */
     .alert {
       margin-top: 1.25rem;
       padding: 1rem;
@@ -383,7 +486,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
       margin-bottom: 4px;
     }
 
-    /* Date and time grid */
     .dt-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -396,7 +498,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
       }
     }
 
-    /* Form inputs */
     .f-lbl {
       display: block;
       font-size: 12px;
@@ -440,12 +541,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
       color: var(--t-muted);
     }
 
-    input[type="date"],
-    input[type="time"] {
+    input[type="date"] {
       color-scheme: light;
     }
 
-    /* Submit button */
     .btn-submit {
       display: block;
       width: 100%;
@@ -497,7 +596,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
 </head>
 
 <body>
-  <!-- Top header -->
   <header>
     <div class="hdr">
       <a href="dashboard.php" class="back-btn">← Back to Dashboard</a>
@@ -505,7 +603,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
     </div>
   </header>
 
-  <!-- Main form -->
   <main>
     <div class="form-card">
       <div class="card-stripe"></div>
@@ -513,10 +610,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
       <div class="card-body">
         <div class="card-title">Book an Appointment</div>
         <div class="card-sub">
-          Reservation only — queue number will be assigned during kiosk check-in on your appointment date.
+          Reservation confirmed — your queue number is generated upon booking. Please check in on your appointment date to validate your slot. Online bookings are prioritized over walk-ins.
         </div>
 
-        <!-- Success message -->
         <?php if ($success): ?>
           <div class="alert alert-ok">
             <div class="alert-title">Booking Confirmed</div>
@@ -524,7 +620,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
           </div>
         <?php endif; ?>
 
-        <!-- Error message -->
         <?php if ($error): ?>
           <div class="alert alert-err">
             <div class="alert-title">Error</div>
@@ -532,11 +627,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
           </div>
         <?php endif; ?>
 
-        <!-- Booking form -->
         <form method="POST" id="apptForm">
           <?php echo csrf_field(); ?>
 
-          <!-- Service selection -->
           <div class="space-y-1">
             <label for="service_select" class="block text-sm font-medium text-slate-800">Select Service *</label>
 
@@ -557,7 +650,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
                       $cur = $row['category_name'];
 
                       $label = $cur;
-
                       if ($cur === 'Membership') {
                         $label = 'Membership (M)';
                       } elseif ($cur === 'Benefit Availment') {
@@ -587,7 +679,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
             <p class="text-xs text-slate-500">Choose a service to enable date &amp; time.</p>
           </div>
 
-          <!-- Client status -->
           <div class="space-y-1 mt-4">
             <label for="client_status" class="block text-sm font-medium text-slate-800">Client Status *</label>
 
@@ -597,8 +688,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
                 name="client_status"
                 required
                 class="w-full appearance-none rounded-xl border border-slate-200 bg-white px-4 py-3 pr-12 text-slate-900 shadow-sm focus:outline-none focus:ring-4 focus:ring-slate-200 focus:border-slate-400">
-                <option value="Regular">Regular</option>
-                <option value="Special Lane">Special Lane (PWD, Senior Citizen, and Pregnant)</option>
+                <option value="regular">Regular</option>
+                <option value="senior">Senior Citizen</option>
+                <option value="pregnant">Pregnant</option>
+                <option value="pwd">PWD</option>
               </select>
 
               <div class="pointer-events-none absolute inset-y-0 right-3 flex items-center text-slate-500">
@@ -609,11 +702,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
             </div>
 
             <p class="text-xs text-amber-700 mt-1">
-              Priority routing: Special Lane (Membership) and (Hospitalization) go to Counter 2.
+              Special-lane reservations are subject to slot availability and staff verification upon check-in.
+              <br>Priority routing: Special Lane (Membership) and (Benefit Availment) go to Counter 2.
             </p>
           </div>
 
-          <!-- Date and time -->
           <div class="dt-grid mt-4">
             <div class="field" style="margin-bottom:0;">
               <label for="appointment_date" class="f-lbl">Appointment Date *</label>
@@ -629,27 +722,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
 
             <div class="field" style="margin-bottom:0;">
               <label for="appointment_time" class="f-lbl">Preferred Time *</label>
-              <input
-                type="time"
+              <select
                 id="appointment_time"
                 name="appointment_time"
                 required
-                min="08:00"
-                max="17:00"
                 disabled
                 class="f-inp">
-              <p class="f-hint">Office hours: 08:00 – 05:00</p>
+                <option value="">-- Select Time --</option>
+              </select>
+              <p class="f-hint">Only available slots will appear here.</p>
             </div>
           </div>
 
-          <!-- Submit -->
           <div style="margin-top:1.5rem;">
             <button type="submit" name="book" class="btn-submit">Confirm Reservation</button>
           </div>
 
           <div class="divider"></div>
 
-          <!-- Footer link -->
           <div class="form-footer">
             <a href="my_appointments.php" class="foot-link">View My Appointments →</a>
           </div>
@@ -658,31 +748,79 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['book'])) {
     </div>
   </main>
 
-  <!-- Enable date and time only if service is selected -->
   <script>
     document.addEventListener('DOMContentLoaded', () => {
-      const s = document.getElementById('service_select');
-      const d = document.getElementById('appointment_date');
-      const t = document.getElementById('appointment_time');
+      const serviceSelect = document.getElementById('service_select');
+      const clientStatus = document.getElementById('client_status');
+      const dateInput = document.getElementById('appointment_date');
+      const timeSelect = document.getElementById('appointment_time');
 
+      function resetTimeOptions(message = '-- Select Time --') {
+        timeSelect.innerHTML = `<option value="">${message}</option>`;
+      }
 
-
-      function setEn(on) {
-        d.disabled = !on;
-        t.disabled = !on;
+      function setEnabled(on) {
+        dateInput.disabled = !on;
+        timeSelect.disabled = !on;
 
         if (!on) {
-          d.value = '';
-          t.value = '';
+          dateInput.value = '';
+          resetTimeOptions();
         }
       }
 
-      setEn(!!s.value);
-      s.addEventListener('change', () => setEn(!!s.value));
+      async function loadAvailableTimes() {
+        const serviceId = serviceSelect.value;
+        const clientType = clientStatus.value;
+        const appointmentDate = dateInput.value;
+
+        if (!serviceId || !clientType || !appointmentDate) {
+          resetTimeOptions('-- Select Time --');
+          timeSelect.disabled = true;
+          return;
+        }
+
+        try {
+          const res = await fetch(
+            `get_available_slots.php?service_id=${encodeURIComponent(serviceId)}&client_status=${encodeURIComponent(clientType)}&date=${encodeURIComponent(appointmentDate)}`, {
+              cache: 'no-store'
+            }
+          );
+
+          const data = await res.json();
+
+          if (!Array.isArray(data) || data.length === 0) {
+            resetTimeOptions('No available slots');
+            timeSelect.disabled = true;
+            return;
+          }
+
+          resetTimeOptions('-- Select Time --');
+          data.forEach(slot => {
+            const opt = document.createElement('option');
+            opt.value = slot.slot_time;
+            opt.textContent = slot.label ?? slot.slot_time;
+            timeSelect.appendChild(opt);
+          });
+          timeSelect.disabled = false;
+        } catch (err) {
+          resetTimeOptions('Failed to load slots');
+          timeSelect.disabled = true;
+        }
+      }
+
+      setEnabled(!!serviceSelect.value);
+
+      serviceSelect.addEventListener('change', () => {
+        setEnabled(!!serviceSelect.value);
+        loadAvailableTimes();
+      });
+
+      clientStatus.addEventListener('change', loadAvailableTimes);
+      dateInput.addEventListener('change', loadAvailableTimes);
     });
   </script>
 
-  <!-- Prevent form resubmit on refresh -->
   <script>
     if (window.history.replaceState) {
       window.history.replaceState(null, null, window.location.href);
